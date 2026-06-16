@@ -12,3 +12,12 @@
 
 # OS / editor
 .DS_Store
+
+# Local config / secrets (never commit)
+local.yaml
+application-local.yaml
+application-local.yml
+*.pem
+*.key
+*.p12
+credentials.json

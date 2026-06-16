@@ -24,6 +24,7 @@ const (
 	defaultPort       = 8085
 	shutdownTimeout   = 10 * time.Second
 	readHeaderTimeout = 5 * time.Second
+	readTimeout       = 30 * time.Second
 )
 
 func main() {
@@ -46,6 +47,7 @@ func main() {
 		Addr:              net.JoinHostPort("", strconv.Itoa(port)),
 		Handler:           r,
 		ReadHeaderTimeout: readHeaderTimeout,
+		ReadTimeout:       readTimeout,
 	}
 
 	slog.Info("ocr-sidecar starting", "port", port)
