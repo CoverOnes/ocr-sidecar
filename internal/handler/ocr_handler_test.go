@@ -2,18 +2,17 @@ package handler
 
 import (
 	"bytes"
-	"crypto/subtle"
+	"encoding/binary"
+	"hash/crc32"
 	"image"
 	"image/color"
 	"image/jpeg"
 	"image/png"
 	"net/http"
 	"net/http/httptest"
-	"os"
 	"strings"
 	"testing"
 
-	"github.com/CoverOnes/ocr-sidecar/internal/platform/httpx"
 	"github.com/gin-gonic/gin"
 )
 
@@ -314,6 +313,84 @@ func encodeOversizedPNG(t *testing.T, w, h int) []byte {
 	return buf.Bytes()
 }
 
+// forgedHeaderPNG builds a tiny but structurally-valid PNG consisting of only
+// the 8-byte signature and a single IHDR chunk that DECLARES the given
+// dimensions. The IHDR CRC is computed correctly so image.DecodeConfig parses
+// it successfully. There is NO IDAT pixel data, so the payload stays tiny —
+// this is exactly the "claim 10000×10000 in <100 KB" attack the pre-decode
+// peek must reject before any pixel buffer is allocated.
+func forgedHeaderPNG(t *testing.T, w, h uint32) []byte {
+	t.Helper()
+
+	var buf bytes.Buffer
+	// PNG signature.
+	buf.Write([]byte{0x89, 0x50, 0x4E, 0x47, 0x0D, 0x0A, 0x1A, 0x0A})
+
+	// IHDR data: width(4) height(4) bitDepth(1) colorType(1) compression(1)
+	// filter(1) interlace(1) = 13 bytes.
+	ihdr := make([]byte, 13)
+	binary.BigEndian.PutUint32(ihdr[0:4], w)
+	binary.BigEndian.PutUint32(ihdr[4:8], h)
+	ihdr[8] = 8 // bit depth
+	ihdr[9] = 0 // color type: grayscale
+	ihdr[10] = 0
+	ihdr[11] = 0
+	ihdr[12] = 0
+
+	// Length (of data only).
+	length := make([]byte, 4)
+	binary.BigEndian.PutUint32(length, uint32(len(ihdr)))
+	buf.Write(length)
+
+	// Type + data, then CRC over (type + data).
+	chunk := append([]byte("IHDR"), ihdr...)
+	buf.Write(chunk)
+	crc := make([]byte, 4)
+	binary.BigEndian.PutUint32(crc, crc32.ChecksumIEEE(chunk))
+	buf.Write(crc)
+
+	return buf.Bytes()
+}
+
+func TestPreprocessImagePreDecodePeek(t *testing.T) {
+	t.Run("forged oversized header rejected pre-decode without allocating pixels", func(t *testing.T) {
+		// Header claims 20000×20000 (~1.6 GB if decoded as 32-bit RGBA) but the
+		// payload is only a few dozen bytes — no IDAT. If the guard ran only
+		// AFTER image.Decode, this would either OOM or fail to decode; the
+		// pre-decode peek must reject it cleanly with the dimension error.
+		raw := forgedHeaderPNG(t, 20000, 20000)
+		if len(raw) > 1024 {
+			t.Fatalf("forged payload unexpectedly large (%d bytes); peek test premise broken", len(raw))
+		}
+		_, err := preprocessImage(raw)
+		if err == nil {
+			t.Fatal("expected dimension error for forged oversized header, got nil")
+		}
+		if !strings.HasPrefix(err.Error(), errDimensionExceeded) {
+			t.Errorf("expected dimension error, got: %v", err)
+		}
+		// The reported dimensions must come from the forged header (20000), proving
+		// rejection happened at the header-peek stage, not from a decoded buffer.
+		if !strings.Contains(err.Error(), "20000x20000") {
+			t.Errorf("error should report forged header dims 20000x20000, got: %v", err)
+		}
+	})
+
+	t.Run("forged header within limit falls through to decode (no IDAT -> decode fails -> raw passthrough)", func(t *testing.T) {
+		// A header-only PNG within the dimension limit passes the peek, then
+		// image.Decode fails (no pixel data) and the function returns the raw
+		// bytes unchanged — confirming the peek does not reject legitimate sizes.
+		raw := forgedHeaderPNG(t, 100, 100)
+		out, err := preprocessImage(raw)
+		if err != nil {
+			t.Fatalf("expected no dimension error for in-limit header, got: %v", err)
+		}
+		if string(out) != string(raw) {
+			t.Errorf("expected raw passthrough when decode fails after a valid in-limit header")
+		}
+	})
+}
+
 func TestPreprocessImageDimensionGuard(t *testing.T) {
 	t.Run("image within limit is processed normally", func(t *testing.T) {
 		// 100×100 is well within maxDecodedDimension (6000).
@@ -364,31 +441,31 @@ func TestPreprocessImageDimensionGuard(t *testing.T) {
 	})
 }
 
-// buildAuthTestRouter creates a Gin engine with the OCR auth middleware and a
-// stub /ocr handler that writes 200 OK (no actual tesseract call). This lets us
-// test the middleware at the HTTP layer without requiring tesseract to be installed.
-func buildAuthTestRouter(token string) *gin.Engine {
+// buildAuthTestRouter creates a Gin engine wired with the PRODUCTION
+// ocrAuthMiddleware() and a stub /ocr handler that writes 200 OK (no actual
+// tesseract call). This lets us test the real middleware at the HTTP layer
+// without requiring tesseract to be installed.
+//
+// ocrAuthMiddleware() reads OCR_SERVICE_TOKEN from the environment at
+// construction time, so the env MUST be set via t.Setenv BEFORE this function
+// builds the engine. t.Setenv auto-restores the prior value at test cleanup and
+// fails fast if the test is parallel — these tests are intentionally serial.
+func buildAuthTestRouter(t *testing.T, token string) *gin.Engine {
+	t.Helper()
+
+	// Drive the real middleware: set (or clear) the env the production factory reads.
+	if token == "" {
+		// Empty value exercises the dev-mode (allow-all) branch of ocrAuthMiddleware.
+		t.Setenv("OCR_SERVICE_TOKEN", "")
+	} else {
+		t.Setenv("OCR_SERVICE_TOKEN", token)
+	}
+
 	gin.SetMode(gin.TestMode)
 	r := gin.New()
 	r.SetTrustedProxies(nil) //nolint:errcheck // test-only engine
 
-	// Build the middleware closure with the given token in the environment.
-	// We cannot call os.Setenv here because tests run in parallel; instead we
-	// directly invoke the middleware factory with the token embedded via a
-	// test-local wrapper that shadows the env read.
-	var mw gin.HandlerFunc
-	if token == "" {
-		// Simulate unset env: dev-mode middleware (allow all).
-		os.Unsetenv("OCR_SERVICE_TOKEN") //nolint:errcheck // test-only
-		mw = ocrAuthMiddleware()
-	} else {
-		// Simulate set env.
-		t := token // capture
-		tokenBytes := []byte(t)
-		mw = authMiddlewareWithToken(tokenBytes)
-	}
-
-	r.POST("/ocr", mw, func(c *gin.Context) {
+	r.POST("/ocr", ocrAuthMiddleware(), func(c *gin.Context) {
 		c.Status(http.StatusOK)
 	})
 	return r
@@ -442,9 +519,8 @@ func TestOCRAuthMiddleware(t *testing.T) {
 	}
 
 	for _, tc := range tests {
-		tc := tc
 		t.Run(tc.name, func(t *testing.T) {
-			engine := buildAuthTestRouter(tc.envToken)
+			engine := buildAuthTestRouter(t, tc.envToken)
 			w := httptest.NewRecorder()
 			r := httptest.NewRequest(http.MethodPost, "/ocr", strings.NewReader(""))
 			if tc.headerToken != "" {
@@ -455,20 +531,5 @@ func TestOCRAuthMiddleware(t *testing.T) {
 				t.Errorf("status = %d, want %d (body: %s)", w.Code, tc.wantStatus, w.Body.String())
 			}
 		})
-	}
-}
-
-// authMiddlewareWithToken is a test helper that builds the auth middleware with
-// an explicit token slice instead of reading from os.Getenv. This avoids
-// os.Setenv races when tests run in parallel.
-func authMiddlewareWithToken(tokenBytes []byte) gin.HandlerFunc {
-	return func(c *gin.Context) {
-		got := c.GetHeader("X-Ocr-Service-Token")
-		if subtle.ConstantTimeCompare([]byte(got), tokenBytes) != 1 {
-			httpx.ErrCode(c, http.StatusUnauthorized, "UNAUTHORIZED", "missing or invalid X-Ocr-Service-Token")
-			c.Abort()
-			return
-		}
-		c.Next()
 	}
 }

@@ -222,17 +222,30 @@ func validateImageType(img []byte, _ string) error {
 // This function is called BEFORE writing to the temp file for tesseract so that
 // the raw input bytes are never persisted — only the processed bytes are.
 func preprocessImage(img []byte) ([]byte, error) {
+	// Pre-decode dimension peek: image.DecodeConfig reads ONLY the header and
+	// returns the declared width/height WITHOUT allocating the pixel buffer.
+	// A crafted PNG/JPEG can claim enormous dimensions (e.g. 10000×10000) in a
+	// tiny compressed payload; rejecting here avoids the multi-hundred-MB heap
+	// allocation that image.Decode would otherwise perform first. We treat a
+	// DecodeConfig failure as "unknown format" and fall through to image.Decode,
+	// which already handles the raw-bytes pass-through path below.
+	if cfg, _, cfgErr := image.DecodeConfig(bytes.NewReader(img)); cfgErr == nil {
+		if cfg.Width > maxDecodedDimension || cfg.Height > maxDecodedDimension {
+			return nil, fmt.Errorf("image dimensions %dx%d exceed limit %d", cfg.Width, cfg.Height, maxDecodedDimension)
+		}
+	}
+
 	src, _, err := image.Decode(bytes.NewReader(img))
 	if err != nil {
 		// Cannot decode: pass through original bytes untouched.
 		return img, nil //nolint:nilerr // deliberate fallback: unknown format, let tesseract try the raw bytes
 	}
 
-	// Dimension guard: a crafted PNG/JPEG can claim enormous pixel dimensions in
-	// a tiny compressed payload. image.Decode allocates the full pixel buffer
-	// before returning, so we must check AFTER decode and reject before
-	// proceeding. This makes preprocessImage's error return meaningful rather
-	// than dead: callers map this error to HTTP 413.
+	// Belt-and-suspenders post-decode guard: the pre-decode peek above already
+	// rejects oversized images before allocation, but we re-check the decoded
+	// bounds in case a decoder reports different dimensions than its header
+	// claimed. This makes preprocessImage's error return meaningful rather than
+	// dead: callers map this error to HTTP 413.
 	b := src.Bounds()
 	if b.Dx() > maxDecodedDimension || b.Dy() > maxDecodedDimension {
 		return nil, fmt.Errorf("image dimensions %dx%d exceed limit %d", b.Dx(), b.Dy(), maxDecodedDimension)
@@ -396,15 +409,6 @@ func (b *limitedBuffer) Write(p []byte) (int, error) {
 
 func (b *limitedBuffer) String() string { return b.buf.String() }
 
-// extractCJKName extracts the holder's Chinese name from OCR text using a
-// two-pass strategy:
-//
-//  1. First pass: look for a CJK block immediately following the "姓名" label.
-//     This is the most reliable signal on well-read TW ID cards.
-//  2. Second pass: scan all CJK blocks left-to-right and return the first one
-//     that is not in the nameStopwords set.
-//
-// Returns an empty string if no suitable name block is found.
 // allRunesAreStopwords reports whether every individual CJK character in s is a
 // single-rune entry in nameStopwords. This catches date fragments like "年月日"
 // that slip through because they are not in the stopwords map as a whole token
@@ -422,6 +426,15 @@ func allRunesAreStopwords(s string) bool {
 	return true
 }
 
+// extractCJKName extracts the holder's Chinese name from OCR text using a
+// two-pass strategy:
+//
+//  1. First pass: look for a CJK block immediately following the "姓名" label.
+//     This is the most reliable signal on well-read TW ID cards.
+//  2. Second pass: scan all CJK blocks left-to-right and return the first one
+//     that is not in the nameStopwords set.
+//
+// Returns an empty string if no suitable name block is found.
 func extractCJKName(text string) string {
 	// Pass 1: "姓名" label → adjacent CJK block.
 	if m := nameAfterLabelPattern.FindStringSubmatch(text); len(m) == 2 {
