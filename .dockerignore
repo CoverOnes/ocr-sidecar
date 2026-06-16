@@ -1,0 +1,20 @@
+# Version control
+.git
+.gitignore
+
+# Test / coverage artefacts
+*.out
+*.test
+
+# Secrets / local config (never bake into image)
+.env*
+local.yaml
+application-local.yaml
+application-local.yml
+*.pem
+*.key
+*.p12
+credentials.json
+
+# Documentation
+README.md

@@ -6,7 +6,7 @@ import (
 	"fmt"
 	"image"
 	"image/color"
-	_ "image/jpeg" // register JPEG decoder for image.Decode
+	_ "image/jpeg"
 	"image/png"
 	"io"
 	"log/slog"
@@ -19,6 +19,8 @@ import (
 
 	"golang.org/x/image/draw"
 
+	// register JPEG decoder for image.Decode
+
 	"github.com/CoverOnes/ocr-sidecar/internal/platform/httpx"
 	"github.com/gin-gonic/gin"
 )
@@ -26,6 +28,32 @@ import (
 // maxImageBytes is the maximum size of an image accepted by the OCR endpoint.
 // This mirrors the kyc service's 8 MB limit so the sidecar never buffers more.
 const maxImageBytes = 8 * 1024 * 1024
+
+// maxDecodedDimension is the maximum allowed width or height (in pixels) after
+// image.Decode. A crafted PNG can claim 10000×10000 dimensions in <100 KB of
+// compressed bytes; decoding it would allocate ~476 MB on the heap.
+// Taiwan national ID cards never legitimately exceed ~4000 px on the long side.
+const maxDecodedDimension = 6000
+
+// maxTesseractStderr caps the portion of tesseract's stderr captured into error
+// messages and logs to avoid unbounded log growth from a misbehaving binary.
+const maxTesseractStderr = 4 * 1024 // 4 KB
+
+// maxConcurrentTesseract is the maximum number of tesseract processes that may
+// run concurrently. Each process can briefly hold ~200 MB of working memory;
+// allowing unlimited concurrency risks OOM under burst traffic.
+const maxConcurrentTesseract = 4
+
+// tesseractSem is the semaphore that enforces maxConcurrentTesseract.
+var tesseractSem = make(chan struct{}, maxConcurrentTesseract)
+
+// init fills the semaphore slots. Using init rather than a pre-filled buffered
+// channel makes the capacity explicit and avoids confusing "send to fill" idiom.
+func init() {
+	for i := 0; i < maxConcurrentTesseract; i++ {
+		tesseractSem <- struct{}{}
+	}
+}
 
 // ocrResponse is the JSON response for POST /ocr.
 type ocrResponse struct {
@@ -115,6 +143,15 @@ func (h *OCRHandler) Handle(c *gin.Context) {
 	text, err := runTesseract(imgBytes)
 	if err != nil {
 		slog.Warn("tesseract OCR failed", "err", err)
+		// Distinguish dimension-guard errors (client fault) from other failures.
+		if isDimensionError(err) {
+			httpx.ErrCode(c, http.StatusRequestEntityTooLarge, "IMAGE_TOO_LARGE", err.Error())
+			return
+		}
+		if isBusyError(err) {
+			httpx.ErrCode(c, http.StatusTooManyRequests, "OCR_BUSY", "OCR service is at capacity; retry shortly")
+			return
+		}
 		httpx.ErrCode(c, http.StatusUnprocessableEntity, "OCR_FAILED", "OCR processing failed")
 		return
 	}
@@ -191,6 +228,16 @@ func preprocessImage(img []byte) ([]byte, error) {
 		return img, nil //nolint:nilerr // deliberate fallback: unknown format, let tesseract try the raw bytes
 	}
 
+	// Dimension guard: a crafted PNG/JPEG can claim enormous pixel dimensions in
+	// a tiny compressed payload. image.Decode allocates the full pixel buffer
+	// before returning, so we must check AFTER decode and reject before
+	// proceeding. This makes preprocessImage's error return meaningful rather
+	// than dead: callers map this error to HTTP 413.
+	b := src.Bounds()
+	if b.Dx() > maxDecodedDimension || b.Dy() > maxDecodedDimension {
+		return nil, fmt.Errorf("image dimensions %dx%d exceed limit %d", b.Dx(), b.Dy(), maxDecodedDimension)
+	}
+
 	bounds := src.Bounds()
 	w := bounds.Dx()
 	h := bounds.Dy()
@@ -201,7 +248,7 @@ func preprocessImage(img []byte) ([]byte, error) {
 		longSide = h
 	}
 
-	var scaled image.Image = src
+	scaled := src
 	if longSide < preprocessMinLongSide {
 		// Compute scale factor and new dimensions.
 		scale := float64(preprocessTargetLongSide) / float64(longSide)
@@ -232,16 +279,52 @@ func preprocessImage(img []byte) ([]byte, error) {
 	return buf.Bytes(), nil
 }
 
+// errDimensionExceeded is a sentinel prefix used to distinguish dimension-guard
+// errors from other preprocessing failures in Handle.
+const errDimensionExceeded = "image dimensions "
+
+// errOCRBusy is returned by runTesseract when the concurrency semaphore is full.
+const errOCRBusy = "ocr busy"
+
+// isDimensionError reports whether err originated from the dimension guard.
+func isDimensionError(err error) bool {
+	return err != nil && strings.HasPrefix(err.Error(), errDimensionExceeded)
+}
+
+// isBusyError reports whether err is the semaphore-full sentinel.
+func isBusyError(err error) bool {
+	return err != nil && err.Error() == errOCRBusy
+}
+
 // runTesseract preprocesses img (upscale + grayscale), writes the result to a
 // temporary file, invokes tesseract with chi_tra+eng language packs, and returns
 // the OCR text output. The temp file is deleted immediately after the process exits.
+//
+// Concurrency is bounded by tesseractSem (maxConcurrentTesseract slots). When
+// all slots are occupied the function returns errOCRBusy immediately so Handle
+// can respond with 429 instead of queuing indefinitely.
 func runTesseract(img []byte) (string, error) {
 	// Preprocess before persisting anything — raw bytes are never written.
+	// NOTE: dimension errors are propagated, not swallowed, so Handle can
+	// distinguish "client sent an oversized image" (→ 413) from other failures.
 	processed, err := preprocessImage(img)
 	if err != nil {
+		// Dimension guard errors are fatal — do not fall back to raw bytes.
+		if isDimensionError(err) {
+			return "", err
+		}
 		slog.Warn("preprocess image failed, using original", "err", err)
 		processed = img
 	}
+
+	// Acquire a concurrency slot (non-blocking).
+	select {
+	case <-tesseractSem:
+		// acquired
+	default:
+		return "", fmt.Errorf("%s", errOCRBusy)
+	}
+	defer func() { tesseractSem <- struct{}{} }()
 
 	// Write preprocessed image to a temp file (tesseract CLI needs a file path).
 	tmpFile, err := os.CreateTemp("", "ocr-*.img")
@@ -253,8 +336,10 @@ func runTesseract(img []byte) (string, error) {
 
 	defer func() {
 		// Always remove the temp file — image is never persisted beyond this scope.
+		// Log only the error; never log tmpPath (it is a local OS path, not useful
+		// to external observers and could be misleading in production logs).
 		if removeErr := os.Remove(tmpPath); removeErr != nil {
-			slog.Warn("failed to remove OCR temp file", "path", tmpPath, "err", removeErr)
+			slog.Warn("failed to remove OCR temp file", "err", removeErr)
 		}
 	}()
 
@@ -277,16 +362,39 @@ func runTesseract(img []byte) (string, error) {
 		"--psm", "6",
 	)
 
-	var stdout, stderr bytes.Buffer
+	var stdout bytes.Buffer
+	// Limit stderr capture to maxTesseractStderr to prevent unbounded log growth
+	// if tesseract writes large amounts of diagnostic output to stderr.
+	stderrLimited := &limitedBuffer{max: maxTesseractStderr}
 	cmd.Stdout = &stdout
-	cmd.Stderr = &stderr
+	cmd.Stderr = stderrLimited
 
 	if err := cmd.Run(); err != nil {
-		return "", fmt.Errorf("tesseract: %w (stderr: %s)", err, stderr.String())
+		return "", fmt.Errorf("tesseract: %w (stderr: %s)", err, stderrLimited.String())
 	}
 
 	return stdout.String(), nil
 }
+
+// limitedBuffer is a bytes.Buffer that stops accepting writes once max bytes
+// have been accumulated. Excess data is silently discarded.
+type limitedBuffer struct {
+	buf bytes.Buffer
+	max int
+}
+
+func (b *limitedBuffer) Write(p []byte) (int, error) {
+	if b.buf.Len() >= b.max {
+		return len(p), nil // silently discard to avoid blocking the subprocess
+	}
+	remaining := b.max - b.buf.Len()
+	if len(p) > remaining {
+		p = p[:remaining]
+	}
+	return b.buf.Write(p)
+}
+
+func (b *limitedBuffer) String() string { return b.buf.String() }
 
 // extractCJKName extracts the holder's Chinese name from OCR text using a
 // two-pass strategy:
@@ -297,20 +405,43 @@ func runTesseract(img []byte) (string, error) {
 //     that is not in the nameStopwords set.
 //
 // Returns an empty string if no suitable name block is found.
+// allRunesAreStopwords reports whether every individual CJK character in s is a
+// single-rune entry in nameStopwords. This catches date fragments like "年月日"
+// that slip through because they are not in the stopwords map as a whole token
+// but are composed entirely of individual stopword characters.
+func allRunesAreStopwords(s string) bool {
+	runes := []rune(s)
+	if len(runes) == 0 {
+		return false
+	}
+	for _, r := range runes {
+		if _, ok := nameStopwords[string(r)]; !ok {
+			return false
+		}
+	}
+	return true
+}
+
 func extractCJKName(text string) string {
 	// Pass 1: "姓名" label → adjacent CJK block.
 	if m := nameAfterLabelPattern.FindStringSubmatch(text); len(m) == 2 {
+		// nameAfterLabelPattern already trims via \s*, but TrimSpace is harmless
+		// and guards against future regex changes.
 		candidate := strings.TrimSpace(m[1])
-		if _, isStop := nameStopwords[candidate]; !isStop && len([]rune(candidate)) >= 2 {
+		if _, isStop := nameStopwords[candidate]; !isStop && !allRunesAreStopwords(candidate) && len([]rune(candidate)) >= 2 {
 			return candidate
 		}
 	}
 
 	// Pass 2: first non-stopword CJK block of length 2–5.
 	for _, candidate := range namePattern.FindAllString(text, -1) {
-		if _, isStop := nameStopwords[candidate]; !isStop {
-			return candidate
+		if _, isStop := nameStopwords[candidate]; isStop {
+			continue
 		}
+		if allRunesAreStopwords(candidate) {
+			continue
+		}
+		return candidate
 	}
 
 	return ""

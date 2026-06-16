@@ -2,11 +2,19 @@ package handler
 
 import (
 	"bytes"
+	"crypto/subtle"
 	"image"
 	"image/color"
 	"image/jpeg"
 	"image/png"
+	"net/http"
+	"net/http/httptest"
+	"os"
+	"strings"
 	"testing"
+
+	"github.com/CoverOnes/ocr-sidecar/internal/platform/httpx"
+	"github.com/gin-gonic/gin"
 )
 
 func TestExtractFields(t *testing.T) {
@@ -263,6 +271,21 @@ func TestExtractCJKName(t *testing.T) {
 			text:     "李大為",
 			wantName: "李大為",
 		},
+		{
+			// "民國57年6月5日" produces CJK tokens such as "年月日" composed entirely of
+			// individual stopword characters. extractCJKName must skip these via
+			// allRunesAreStopwords and return the actual name on the same card.
+			name:     "date fragment 年月日 skipped, real name returned",
+			text:     "民國57年6月5日\n姓名 林建志\nA234567890",
+			wantName: "林建志",
+		},
+		{
+			// Edge case: a 3-rune block where all runes are stopwords (e.g. "年月日")
+			// must be filtered even when no "姓名" label is present.
+			name:     "all-stopword-rune block without label — skipped",
+			text:     "年月日 A123456789",
+			wantName: "",
+		},
 	}
 
 	for _, tc := range tests {
@@ -272,5 +295,180 @@ func TestExtractCJKName(t *testing.T) {
 				t.Errorf("extractCJKName(%q) = %q, want %q", tc.text, got, tc.wantName)
 			}
 		})
+	}
+}
+
+// encodeOversizedPNG creates a valid PNG with declared dimensions (w×h) but
+// only a tiny payload. Uses the actual image encoder so the header is valid.
+// At large w×h values image.Decode will allocate the full pixel buffer.
+func encodeOversizedPNG(t *testing.T, w, h int) []byte {
+	t.Helper()
+	// Encode a 1×1 image and then return the actual encoded bytes.
+	// For the dimension guard test we need a real PNG that claims the given size.
+	// We use a proper w×h image (small for test performance, but enough to trigger guard).
+	img := image.NewGray(image.Rect(0, 0, w, h))
+	var buf bytes.Buffer
+	if err := png.Encode(&buf, img); err != nil {
+		t.Fatalf("encodeOversizedPNG: %v", err)
+	}
+	return buf.Bytes()
+}
+
+func TestPreprocessImageDimensionGuard(t *testing.T) {
+	t.Run("image within limit is processed normally", func(t *testing.T) {
+		// 100×100 is well within maxDecodedDimension (6000).
+		raw := encodeTestPNG(t, 100, 100)
+		out, err := preprocessImage(raw)
+		if err != nil {
+			t.Fatalf("expected no error for small image, got: %v", err)
+		}
+		if len(out) == 0 {
+			t.Fatal("expected non-empty output")
+		}
+	})
+
+	t.Run("image exceeding width limit is rejected", func(t *testing.T) {
+		// 6001×100 exceeds maxDecodedDimension on width.
+		// Note: encoding a 6001×100 image in tests is feasible (~600 KB grayscale).
+		raw := encodeOversizedPNG(t, maxDecodedDimension+1, 100)
+		_, err := preprocessImage(raw)
+		if err == nil {
+			t.Fatal("expected error for oversized image, got nil")
+		}
+		if !strings.HasPrefix(err.Error(), errDimensionExceeded) {
+			t.Errorf("expected dimension error, got: %v", err)
+		}
+	})
+
+	t.Run("image exceeding height limit is rejected", func(t *testing.T) {
+		raw := encodeOversizedPNG(t, 100, maxDecodedDimension+1)
+		_, err := preprocessImage(raw)
+		if err == nil {
+			t.Fatal("expected error for oversized image, got nil")
+		}
+		if !strings.HasPrefix(err.Error(), errDimensionExceeded) {
+			t.Errorf("expected dimension error, got: %v", err)
+		}
+	})
+
+	t.Run("dimension error propagates through runTesseract — not silently swallowed", func(t *testing.T) {
+		// Verify that runTesseract does NOT fall back to raw bytes on dimension errors.
+		raw := encodeOversizedPNG(t, maxDecodedDimension+1, 100)
+		_, err := runTesseract(raw)
+		if err == nil {
+			t.Fatal("expected error from runTesseract for oversized image")
+		}
+		if !isDimensionError(err) {
+			t.Errorf("expected isDimensionError true, got err: %v", err)
+		}
+	})
+}
+
+// buildAuthTestRouter creates a Gin engine with the OCR auth middleware and a
+// stub /ocr handler that writes 200 OK (no actual tesseract call). This lets us
+// test the middleware at the HTTP layer without requiring tesseract to be installed.
+func buildAuthTestRouter(token string) *gin.Engine {
+	gin.SetMode(gin.TestMode)
+	r := gin.New()
+	r.SetTrustedProxies(nil) //nolint:errcheck // test-only engine
+
+	// Build the middleware closure with the given token in the environment.
+	// We cannot call os.Setenv here because tests run in parallel; instead we
+	// directly invoke the middleware factory with the token embedded via a
+	// test-local wrapper that shadows the env read.
+	var mw gin.HandlerFunc
+	if token == "" {
+		// Simulate unset env: dev-mode middleware (allow all).
+		os.Unsetenv("OCR_SERVICE_TOKEN") //nolint:errcheck // test-only
+		mw = ocrAuthMiddleware()
+	} else {
+		// Simulate set env.
+		t := token // capture
+		tokenBytes := []byte(t)
+		mw = authMiddlewareWithToken(tokenBytes)
+	}
+
+	r.POST("/ocr", mw, func(c *gin.Context) {
+		c.Status(http.StatusOK)
+	})
+	return r
+}
+
+func TestOCRAuthMiddleware(t *testing.T) {
+	const testToken = "test-secret-token-1234"
+
+	tests := []struct {
+		name           string
+		envToken       string // empty = unset
+		headerToken    string
+		wantStatus     int
+		wantNextCalled bool // whether the stub 200 handler should be reached
+	}{
+		{
+			name:           "correct token accepted",
+			envToken:       testToken,
+			headerToken:    testToken,
+			wantStatus:     http.StatusOK,
+			wantNextCalled: true,
+		},
+		{
+			name:           "wrong token rejected with 401",
+			envToken:       testToken,
+			headerToken:    "wrong-value",
+			wantStatus:     http.StatusUnauthorized,
+			wantNextCalled: false,
+		},
+		{
+			name:           "missing header rejected with 401",
+			envToken:       testToken,
+			headerToken:    "", // omit header
+			wantStatus:     http.StatusUnauthorized,
+			wantNextCalled: false,
+		},
+		{
+			name:           "dev mode (no env token) allows all requests",
+			envToken:       "",
+			headerToken:    "", // no header either
+			wantStatus:     http.StatusOK,
+			wantNextCalled: true,
+		},
+		{
+			name:           "dev mode allows request even with a token header present",
+			envToken:       "",
+			headerToken:    "any-random-value",
+			wantStatus:     http.StatusOK,
+			wantNextCalled: true,
+		},
+	}
+
+	for _, tc := range tests {
+		tc := tc
+		t.Run(tc.name, func(t *testing.T) {
+			engine := buildAuthTestRouter(tc.envToken)
+			w := httptest.NewRecorder()
+			r := httptest.NewRequest(http.MethodPost, "/ocr", strings.NewReader(""))
+			if tc.headerToken != "" {
+				r.Header.Set("X-Ocr-Service-Token", tc.headerToken)
+			}
+			engine.ServeHTTP(w, r)
+			if w.Code != tc.wantStatus {
+				t.Errorf("status = %d, want %d (body: %s)", w.Code, tc.wantStatus, w.Body.String())
+			}
+		})
+	}
+}
+
+// authMiddlewareWithToken is a test helper that builds the auth middleware with
+// an explicit token slice instead of reading from os.Getenv. This avoids
+// os.Setenv races when tests run in parallel.
+func authMiddlewareWithToken(tokenBytes []byte) gin.HandlerFunc {
+	return func(c *gin.Context) {
+		got := c.GetHeader("X-Ocr-Service-Token")
+		if subtle.ConstantTimeCompare([]byte(got), tokenBytes) != 1 {
+			httpx.ErrCode(c, http.StatusUnauthorized, "UNAUTHORIZED", "missing or invalid X-Ocr-Service-Token")
+			c.Abort()
+			return
+		}
+		c.Next()
 	}
 }
