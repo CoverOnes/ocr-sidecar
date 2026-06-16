@@ -1,0 +1,14 @@
+# Compiled server binary
+/server
+
+# Test / coverage output
+*.out
+*.test
+
+# Local env (never commit secrets)
+.env
+.env.local
+.env.*.local
+
+# OS / editor
+.DS_Store
