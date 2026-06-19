@@ -17,6 +17,7 @@ import (
 	"path/filepath"
 	"regexp"
 	"strings"
+	"syscall"
 	"time"
 
 	"golang.org/x/image/draw"
@@ -142,13 +143,17 @@ func (h *OCRHandler) Handle(c *gin.Context) {
 
 	imgBytes, contentType, err := readImage(c)
 	if err != nil {
-		httpx.ErrCode(c, http.StatusBadRequest, "INVALID_IMAGE", err.Error())
+		// Log the raw error server-side only; never echo internal detail to the client.
+		slog.Warn("image read failed", "err", err)
+		httpx.ErrCode(c, http.StatusBadRequest, "INVALID_IMAGE", "invalid or unsupported image")
 		return
 	}
 
 	// Validate content type against the magic-byte allowlist.
 	if err := validateImageType(imgBytes, contentType); err != nil {
-		httpx.ErrCode(c, http.StatusBadRequest, "INVALID_IMAGE_TYPE", err.Error())
+		// Log the raw error server-side only; never echo internal detail to the client.
+		slog.Debug("image type validation failed", "err", err)
+		httpx.ErrCode(c, http.StatusBadRequest, "INVALID_IMAGE_TYPE", "invalid or unsupported image")
 		return
 	}
 
@@ -392,6 +397,32 @@ func runTesseract(img []byte) (string, error) {
 		"-l", "chi_tra+eng",
 		"--psm", "6",
 	)
+
+	// Place tesseract in its own process group so that on timeout we can send
+	// SIGKILL to the entire group (-pgid), killing any children tesseract may
+	// have spawned (e.g. helper daemons, spawned sub-processes). Without this,
+	// exec.CommandContext only kills the direct tesseract process; orphaned
+	// children continue running and accumulate over time.
+	cmd.SysProcAttr = &syscall.SysProcAttr{Setpgid: true}
+
+	// WaitDelay gives the process group up to 2 seconds to flush any remaining
+	// I/O after the context cancels before cmd.Wait returns. This prevents
+	// WaitDelay causing Wait to return prematurely if tesseract writes output
+	// close to the deadline.
+	cmd.WaitDelay = 2 * time.Second
+
+	// Cancel is called by exec.CommandContext when tctx is done. We override the
+	// default (SIGKILL to cmd.Process only) to send SIGKILL to the entire process
+	// GROUP so orphaned children are also reaped. The negative PID is the pgid
+	// signal convention: Kill(-pgid, sig) → all processes in the group.
+	// Guard against nil Process in case the command never started.
+	cmd.Cancel = func() error {
+		if cmd.Process == nil {
+			return nil
+		}
+		//nolint:gosec // G204 not applicable; this is a signal, not a shell command
+		return syscall.Kill(-cmd.Process.Pid, syscall.SIGKILL)
+	}
 
 	// Limit stdout to maxTesseractStdout (64 KB) to prevent OOM from a runaway
 	// process. A real Taiwan ID card produces at most a few hundred bytes of text.
