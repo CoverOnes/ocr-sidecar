@@ -9,6 +9,7 @@ import (
 	"image/color"
 	"image/jpeg"
 	"image/png"
+	"mime/multipart"
 	"net/http"
 	"net/http/httptest"
 	"os/exec"
@@ -865,5 +866,72 @@ func TestHandleValidationErrorsNotEchoed(t *testing.T) {
 				t.Errorf("response body missing error code %q; got: %s", tc.wantCode, body)
 			}
 		})
+	}
+}
+
+// TestHandleInvalidImageNotEchoed verifies the INVALID_IMAGE path: a
+// multipart/form-data POST with NO "image" field causes readImage to return
+// "missing image field" and the handler responds with INVALID_IMAGE + the fixed
+// client-safe message. Internal strings like "missing image field" must NOT be
+// echoed to the client.
+func TestHandleInvalidImageNotEchoed(t *testing.T) {
+	gin.SetMode(gin.TestMode)
+
+	t.Setenv("OCR_ALLOW_NOAUTH", "true")
+	t.Setenv("OCR_SERVICE_TOKEN", "")
+	authMiddleware, err := ocrAuthMiddleware()
+	if err != nil {
+		t.Fatalf("ocrAuthMiddleware: %v", err)
+	}
+
+	r := gin.New()
+	r.SetTrustedProxies(nil) //nolint:errcheck // test-only engine
+	h := NewOCRHandler()
+	r.POST("/ocr", authMiddleware, h.Handle)
+
+	const fixedMsg = "invalid or unsupported image"
+
+	// Build a multipart/form-data body that contains no "image" field so that
+	// c.Request.FormFile("image") returns an error ("missing image field"),
+	// triggering the INVALID_IMAGE error code path in Handle.
+	var buf bytes.Buffer
+	mw := multipart.NewWriter(&buf)
+	// Write an unrelated field — NOT "image" — so the body is valid multipart
+	// but the required field is absent.
+	if fw, werr := mw.CreateFormField("unrelated"); werr == nil {
+		_, _ = fw.Write([]byte("dummy"))
+	}
+	_ = mw.Close()
+
+	w := httptest.NewRecorder()
+	req := httptest.NewRequest(http.MethodPost, "/ocr", &buf)
+	req.Header.Set("Content-Type", mw.FormDataContentType())
+	r.ServeHTTP(w, req)
+
+	respBody := w.Body.String()
+
+	if w.Code != http.StatusBadRequest {
+		t.Fatalf("expected 400, got %d (body: %s)", w.Code, respBody)
+	}
+
+	// Must carry the INVALID_IMAGE error code.
+	if !strings.Contains(respBody, "INVALID_IMAGE") {
+		t.Errorf("response should contain INVALID_IMAGE code; got: %s", respBody)
+	}
+
+	// Must carry the fixed client-safe message.
+	if !strings.Contains(respBody, fixedMsg) {
+		t.Errorf("response should contain fixed message %q; got: %s", fixedMsg, respBody)
+	}
+
+	// Must NOT echo the internal error string from readImage.
+	internalPhrases := []string{
+		"missing image field",
+		"http: no such file",
+	}
+	for _, phrase := range internalPhrases {
+		if strings.Contains(respBody, phrase) {
+			t.Errorf("response leaks internal phrase %q; got: %s", phrase, respBody)
+		}
 	}
 }
