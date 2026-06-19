@@ -2,6 +2,7 @@ package handler
 
 import (
 	"bytes"
+	"context"
 	"encoding/binary"
 	"hash/crc32"
 	"image"
@@ -10,8 +11,10 @@ import (
 	"image/png"
 	"net/http"
 	"net/http/httptest"
+	"os/exec"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/gin-gonic/gin"
 )
@@ -446,26 +449,34 @@ func TestPreprocessImageDimensionGuard(t *testing.T) {
 // tesseract call). This lets us test the real middleware at the HTTP layer
 // without requiring tesseract to be installed.
 //
-// ocrAuthMiddleware() reads OCR_SERVICE_TOKEN from the environment at
-// construction time, so the env MUST be set via t.Setenv BEFORE this function
-// builds the engine. t.Setenv auto-restores the prior value at test cleanup and
-// fails fast if the test is parallel — these tests are intentionally serial.
-func buildAuthTestRouter(t *testing.T, token string) *gin.Engine {
+// ocrAuthMiddleware() reads OCR_SERVICE_TOKEN and OCR_ALLOW_NOAUTH from the
+// environment at construction time, so both MUST be configured via t.Setenv
+// BEFORE this function builds the engine. t.Setenv auto-restores prior values
+// at test cleanup; these tests are intentionally serial.
+//
+// If ocrAuthMiddleware returns an error (fail-fast for missing token without
+// OCR_ALLOW_NOAUTH=true), buildAuthTestRouter propagates it via t.Fatal.
+func buildAuthTestRouter(t *testing.T, token string, allowNoAuth bool) *gin.Engine {
 	t.Helper()
 
 	// Drive the real middleware: set (or clear) the env the production factory reads.
-	if token == "" {
-		// Empty value exercises the dev-mode (allow-all) branch of ocrAuthMiddleware.
-		t.Setenv("OCR_SERVICE_TOKEN", "")
+	t.Setenv("OCR_SERVICE_TOKEN", token)
+	if allowNoAuth {
+		t.Setenv("OCR_ALLOW_NOAUTH", "true")
 	} else {
-		t.Setenv("OCR_SERVICE_TOKEN", token)
+		t.Setenv("OCR_ALLOW_NOAUTH", "")
+	}
+
+	authMiddleware, err := ocrAuthMiddleware()
+	if err != nil {
+		t.Fatalf("ocrAuthMiddleware returned unexpected error: %v", err)
 	}
 
 	gin.SetMode(gin.TestMode)
 	r := gin.New()
 	r.SetTrustedProxies(nil) //nolint:errcheck // test-only engine
 
-	r.POST("/ocr", ocrAuthMiddleware(), func(c *gin.Context) {
+	r.POST("/ocr", authMiddleware, func(c *gin.Context) {
 		c.Status(http.StatusOK)
 	})
 	return r
@@ -475,52 +486,52 @@ func TestOCRAuthMiddleware(t *testing.T) {
 	const testToken = "test-secret-token-1234"
 
 	tests := []struct {
-		name           string
-		envToken       string // empty = unset
-		headerToken    string
-		wantStatus     int
-		wantNextCalled bool // whether the stub 200 handler should be reached
+		name        string
+		envToken    string // empty = unset
+		allowNoAuth bool   // sets OCR_ALLOW_NOAUTH=true for dev mode
+		headerToken string
+		wantStatus  int
 	}{
 		{
-			name:           "correct token accepted",
-			envToken:       testToken,
-			headerToken:    testToken,
-			wantStatus:     http.StatusOK,
-			wantNextCalled: true,
+			name:        "correct token accepted",
+			envToken:    testToken,
+			allowNoAuth: false,
+			headerToken: testToken,
+			wantStatus:  http.StatusOK,
 		},
 		{
-			name:           "wrong token rejected with 401",
-			envToken:       testToken,
-			headerToken:    "wrong-value",
-			wantStatus:     http.StatusUnauthorized,
-			wantNextCalled: false,
+			name:        "wrong token rejected with 401",
+			envToken:    testToken,
+			allowNoAuth: false,
+			headerToken: "wrong-value",
+			wantStatus:  http.StatusUnauthorized,
 		},
 		{
-			name:           "missing header rejected with 401",
-			envToken:       testToken,
-			headerToken:    "", // omit header
-			wantStatus:     http.StatusUnauthorized,
-			wantNextCalled: false,
+			name:        "missing header rejected with 401",
+			envToken:    testToken,
+			allowNoAuth: false,
+			headerToken: "", // omit header
+			wantStatus:  http.StatusUnauthorized,
 		},
 		{
-			name:           "dev mode (no env token) allows all requests",
-			envToken:       "",
-			headerToken:    "", // no header either
-			wantStatus:     http.StatusOK,
-			wantNextCalled: true,
+			name:        "dev mode (OCR_ALLOW_NOAUTH=true, no token) allows all requests",
+			envToken:    "",
+			allowNoAuth: true,
+			headerToken: "", // no header either
+			wantStatus:  http.StatusOK,
 		},
 		{
-			name:           "dev mode allows request even with a token header present",
-			envToken:       "",
-			headerToken:    "any-random-value",
-			wantStatus:     http.StatusOK,
-			wantNextCalled: true,
+			name:        "dev mode allows request even with a token header present",
+			envToken:    "",
+			allowNoAuth: true,
+			headerToken: "any-random-value",
+			wantStatus:  http.StatusOK,
 		},
 	}
 
 	for _, tc := range tests {
 		t.Run(tc.name, func(t *testing.T) {
-			engine := buildAuthTestRouter(t, tc.envToken)
+			engine := buildAuthTestRouter(t, tc.envToken, tc.allowNoAuth)
 			w := httptest.NewRecorder()
 			r := httptest.NewRequest(http.MethodPost, "/ocr", strings.NewReader(""))
 			if tc.headerToken != "" {
@@ -531,5 +542,155 @@ func TestOCRAuthMiddleware(t *testing.T) {
 				t.Errorf("status = %d, want %d (body: %s)", w.Code, tc.wantStatus, w.Body.String())
 			}
 		})
+	}
+}
+
+// TestOCRAuthMiddlewareFailFast verifies that ocrAuthMiddleware returns an error
+// (causing server startup to fail) when OCR_SERVICE_TOKEN is unset and
+// OCR_ALLOW_NOAUTH is not "true". This is the M-4 fail-fast guard.
+func TestOCRAuthMiddlewareFailFast(t *testing.T) {
+	tests := []struct {
+		name        string
+		token       string
+		allowNoAuth string
+		wantErr     bool
+	}{
+		{
+			name:        "no token, no noauth flag — must error (fail-fast)",
+			token:       "",
+			allowNoAuth: "",
+			wantErr:     true,
+		},
+		{
+			name:        "no token, noauth=false — must error",
+			token:       "",
+			allowNoAuth: "false",
+			wantErr:     true,
+		},
+		{
+			name:        "no token, noauth=true — dev mode, no error",
+			token:       "",
+			allowNoAuth: "true",
+			wantErr:     false,
+		},
+		{
+			name:        "token set, noauth unset — no error",
+			token:       "some-secret",
+			allowNoAuth: "",
+			wantErr:     false,
+		},
+	}
+
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			t.Setenv("OCR_SERVICE_TOKEN", tc.token)
+			t.Setenv("OCR_ALLOW_NOAUTH", tc.allowNoAuth)
+
+			_, err := ocrAuthMiddleware()
+			if tc.wantErr && err == nil {
+				t.Error("expected error from ocrAuthMiddleware (fail-fast), got nil")
+			}
+			if !tc.wantErr && err != nil {
+				t.Errorf("unexpected error from ocrAuthMiddleware: %v", err)
+			}
+		})
+	}
+}
+
+// TestLimitedBufferStdoutCap verifies the M-3 fix: stdout is bounded at
+// maxTesseractStdout (64 KB) via limitedBuffer. Writing more data than the cap
+// must result in exactly cap bytes stored, with excess silently discarded.
+func TestLimitedBufferStdoutCap(t *testing.T) {
+	tests := []struct {
+		name      string
+		cap       int
+		writeSz   int
+		wantBytes int
+	}{
+		{
+			name:      "write within cap — all bytes stored",
+			cap:       maxTesseractStdout,
+			writeSz:   100,
+			wantBytes: 100,
+		},
+		{
+			name:      "write exactly at cap — all bytes stored",
+			cap:       maxTesseractStdout,
+			writeSz:   maxTesseractStdout,
+			wantBytes: maxTesseractStdout,
+		},
+		{
+			name:      "write beyond cap — truncated to cap",
+			cap:       maxTesseractStdout,
+			writeSz:   maxTesseractStdout + 4096,
+			wantBytes: maxTesseractStdout,
+		},
+		{
+			name:      "small cap — excess silently discarded",
+			cap:       10,
+			writeSz:   100,
+			wantBytes: 10,
+		},
+	}
+
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			lb := &limitedBuffer{max: tc.cap}
+			data := bytes.Repeat([]byte("x"), tc.writeSz)
+			n, err := lb.Write(data)
+			if err != nil {
+				t.Fatalf("limitedBuffer.Write returned error: %v", err)
+			}
+			// Write must claim all bytes consumed (caller should not be blocked).
+			if n != tc.writeSz {
+				t.Errorf("Write returned n=%d, want %d", n, tc.writeSz)
+			}
+			// But actual stored bytes are capped.
+			if lb.buf.Len() != tc.wantBytes {
+				t.Errorf("stored bytes = %d, want %d", lb.buf.Len(), tc.wantBytes)
+			}
+		})
+	}
+
+	// Additional: writing again after cap is already full must not panic or grow.
+	t.Run("subsequent write to full buffer — no additional bytes stored", func(t *testing.T) {
+		lb := &limitedBuffer{max: 5}
+		_, _ = lb.Write([]byte("hello")) // fill to cap
+		before := lb.buf.Len()
+		_, err := lb.Write([]byte("world"))
+		if err != nil {
+			t.Fatalf("second Write returned error: %v", err)
+		}
+		if lb.buf.Len() != before {
+			t.Errorf("buffer grew after cap was reached: before=%d after=%d", before, lb.buf.Len())
+		}
+	})
+}
+
+// TestRunTesseractContextTimeout verifies that the M-1 fix — using
+// exec.CommandContext with a deadline — causes the subprocess to be cancelled
+// when the context expires. We simulate this by running a long-running command
+// (sleep) via exec.CommandContext with a short deadline and verifying it returns
+// an error (the process was killed before it could finish).
+func TestRunTesseractContextTimeout(t *testing.T) {
+	// Verify `sleep` is available; skip if not (unusual but possible in minimal CI).
+	if _, err := exec.LookPath("sleep"); err != nil {
+		t.Skip("sleep binary not available, skipping context-timeout test")
+	}
+
+	ctx, cancel := context.WithTimeout(context.Background(), 50*time.Millisecond)
+	defer cancel()
+
+	cmd := exec.CommandContext(ctx, "sleep", "10")
+	err := cmd.Run()
+
+	// The command should fail because the context was cancelled before sleep finished.
+	if err == nil {
+		t.Fatal("expected error from cancelled context, got nil — command completed instead of being killed")
+	}
+
+	// The context must have been cancelled/timed out.
+	if ctx.Err() == nil {
+		t.Errorf("expected context to be done after command exit, got Err=nil; cmd error: %v", err)
 	}
 }

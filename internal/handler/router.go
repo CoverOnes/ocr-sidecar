@@ -2,6 +2,8 @@ package handler
 
 import (
 	"crypto/subtle"
+	"errors"
+	"fmt"
 	"log/slog"
 	"net/http"
 	"os"
@@ -17,7 +19,16 @@ import (
 // If the env var is non-empty, POST /ocr requires the caller to present the
 // matching value in the X-Ocr-Service-Token header (constant-time compare).
 // /healthz and /readyz are always unauthenticated.
-func NewRouter() *gin.Engine {
+//
+// Returns an error if OCR_SERVICE_TOKEN is unset and OCR_ALLOW_NOAUTH != "true".
+// This prevents the sidecar from silently starting in an unauthenticated state
+// in production environments where the token was accidentally omitted.
+func NewRouter() (*gin.Engine, error) {
+	authMiddleware, err := ocrAuthMiddleware()
+	if err != nil {
+		return nil, err
+	}
+
 	gin.SetMode(gin.ReleaseMode)
 
 	r := gin.New()
@@ -26,7 +37,7 @@ func NewRouter() *gin.Engine {
 	r.Use(func(c *gin.Context) {
 		defer func() {
 			if rec := recover(); rec != nil {
-				slog.Error("panic recovered", "panic", rec)
+				slog.Error("panic recovered", "panicType", fmt.Sprintf("%T", rec))
 				c.AbortWithStatus(500)
 			}
 		}()
@@ -40,9 +51,9 @@ func NewRouter() *gin.Engine {
 	r.GET("/readyz", h.Readiness)
 
 	ocrH := NewOCRHandler()
-	r.POST("/ocr", ocrAuthMiddleware(), ocrH.Handle)
+	r.POST("/ocr", authMiddleware, ocrH.Handle)
 
-	return r
+	return r, nil
 }
 
 // ocrAuthMiddleware returns a Gin middleware that enforces the OCR_SERVICE_TOKEN
@@ -50,13 +61,19 @@ func NewRouter() *gin.Engine {
 // repeated os.Getenv calls in the hot path.
 //
 // Behaviour:
-//   - Token non-empty → require X-Ocr-Service-Token header to match; 401 otherwise.
-//   - Token empty     → dev fallback: allow all, emit a slog.Warn once at startup.
-func ocrAuthMiddleware() gin.HandlerFunc {
+//   - Token non-empty    → require X-Ocr-Service-Token header to match; 401 otherwise.
+//   - Token empty + OCR_ALLOW_NOAUTH=true → dev mode: allow all, emit slog.Warn.
+//   - Token empty + OCR_ALLOW_NOAUTH unset/false → fail-fast: return error so the
+//     server refuses to start, preventing silent unauthenticated exposure.
+func ocrAuthMiddleware() (gin.HandlerFunc, error) {
 	token := os.Getenv("OCR_SERVICE_TOKEN")
 	if token == "" {
-		slog.Warn("ocr-sidecar running WITHOUT auth (OCR_SERVICE_TOKEN unset) — dev only")
-		return func(c *gin.Context) { c.Next() }
+		if os.Getenv("OCR_ALLOW_NOAUTH") == "true" {
+			slog.Warn("ocr-sidecar running WITHOUT auth (OCR_SERVICE_TOKEN unset, OCR_ALLOW_NOAUTH=true) — dev only")
+			return func(c *gin.Context) { c.Next() }, nil
+		}
+		slog.Error("OCR_SERVICE_TOKEN is not set and OCR_ALLOW_NOAUTH is not true — refusing to start without auth")
+		return nil, errors.New("OCR_SERVICE_TOKEN must be set in production; set OCR_ALLOW_NOAUTH=true to run without auth in dev")
 	}
 
 	tokenBytes := []byte(token)
@@ -70,7 +87,7 @@ func ocrAuthMiddleware() gin.HandlerFunc {
 			return
 		}
 		c.Next()
-	}
+	}, nil
 }
 
 // accessLogger returns a minimal slog-based access-log middleware.

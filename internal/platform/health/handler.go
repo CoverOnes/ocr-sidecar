@@ -21,9 +21,11 @@ func (h *Handler) Liveness(c *gin.Context) {
 }
 
 // Readiness handles GET /readyz — checks tesseract is available.
+// On failure a generic message is returned; OS/path details are not exposed to
+// unauthenticated callers to avoid leaking information about the runtime environment.
 func (h *Handler) Readiness(c *gin.Context) {
 	if err := checkTesseract(); err != nil {
-		c.JSON(http.StatusServiceUnavailable, gin.H{"status": "not ready", "error": err.Error()})
+		c.JSON(http.StatusServiceUnavailable, gin.H{"status": "not ready", "error": "tesseract unavailable"})
 		return
 	}
 
