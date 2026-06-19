@@ -735,6 +735,51 @@ func TestProcessGroupKillOnTimeout(t *testing.T) {
 // TestHandleValidationErrorsNotEchoed verifies round-2 fix [2]: the HTTP
 // handler returns a FIXED client-safe message for INVALID_IMAGE and
 // INVALID_IMAGE_TYPE codes, not the raw internal err.Error() string.
+// TestHandleImageTooLargeNotEchoed verifies that a forged-oversized-dimension
+// image returns a STATIC IMAGE_TOO_LARGE message and does NOT echo the raw error
+// (which embeds the exact pixel dimensions and the internal maxDecodedDimension
+// constant). Closes the third validation-error-echo branch missed in round-2.
+func TestHandleImageTooLargeNotEchoed(t *testing.T) {
+	gin.SetMode(gin.TestMode)
+	t.Setenv("OCR_ALLOW_NOAUTH", "true")
+	t.Setenv("OCR_SERVICE_TOKEN", "")
+	authMiddleware, err := ocrAuthMiddleware()
+	if err != nil {
+		t.Fatalf("ocrAuthMiddleware: %v", err)
+	}
+
+	r := gin.New()
+	r.SetTrustedProxies(nil) //nolint:errcheck // test-only engine
+	h := NewOCRHandler()
+	r.POST("/ocr", authMiddleware, h.Handle)
+
+	// Valid PNG magic + IHDR declaring 10000x10000 (> maxDecodedDimension 6000),
+	// only a few hundred bytes on the wire (the "claim huge in <100 KB" attack).
+	body := forgedHeaderPNG(t, 10000, 10000)
+
+	w := httptest.NewRecorder()
+	req := httptest.NewRequest(http.MethodPost, "/ocr", bytes.NewReader(body))
+	req.Header.Set("Content-Type", "image/png")
+	r.ServeHTTP(w, req)
+
+	if w.Code != http.StatusRequestEntityTooLarge {
+		t.Fatalf("expected 413, got %d (body: %s)", w.Code, w.Body.String())
+	}
+	respBody := w.Body.String()
+	if !strings.Contains(respBody, "IMAGE_TOO_LARGE") {
+		t.Errorf("response should carry IMAGE_TOO_LARGE code; got: %s", respBody)
+	}
+	if !strings.Contains(respBody, "image dimensions exceed the allowed limit") {
+		t.Errorf("response should carry the static dimension message; got: %s", respBody)
+	}
+	// MUST NOT leak the exact dimensions or the internal limit constant.
+	for _, leak := range []string{"10000", "6000"} {
+		if strings.Contains(respBody, leak) {
+			t.Errorf("response leaks internal detail %q: %s", leak, respBody)
+		}
+	}
+}
+
 func TestHandleValidationErrorsNotEchoed(t *testing.T) {
 	gin.SetMode(gin.TestMode)
 

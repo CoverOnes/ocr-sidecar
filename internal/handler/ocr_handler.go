@@ -162,7 +162,10 @@ func (h *OCRHandler) Handle(c *gin.Context) {
 		slog.Warn("tesseract OCR failed", "err", err)
 		// Distinguish dimension-guard errors (client fault) from other failures.
 		if isDimensionError(err) {
-			httpx.ErrCode(c, http.StatusRequestEntityTooLarge, "IMAGE_TOO_LARGE", err.Error())
+			// Static client message: the raw error (logged above) embeds the exact
+			// pixel dimensions and the internal maxDecodedDimension constant — do not
+			// echo those to the client (consistent with the other validation paths).
+			httpx.ErrCode(c, http.StatusRequestEntityTooLarge, "IMAGE_TOO_LARGE", "image dimensions exceed the allowed limit")
 			return
 		}
 		if isBusyError(err) {
@@ -405,10 +408,10 @@ func runTesseract(img []byte) (string, error) {
 	// children continue running and accumulate over time.
 	cmd.SysProcAttr = &syscall.SysProcAttr{Setpgid: true}
 
-	// WaitDelay gives the process group up to 2 seconds to flush any remaining
-	// I/O after the context cancels before cmd.Wait returns. This prevents
-	// WaitDelay causing Wait to return prematurely if tesseract writes output
-	// close to the deadline.
+	// WaitDelay gives the process group up to 2 seconds to drain remaining
+	// stdout/stderr after SIGKILL (sent by Cancel) before cmd.Wait closes the
+	// pipes and returns. It only takes effect after cancellation; the happy path
+	// (process exits before the deadline) is unaffected.
 	cmd.WaitDelay = 2 * time.Second
 
 	// Cancel is called by exec.CommandContext when tctx is done. We override the
@@ -420,7 +423,7 @@ func runTesseract(img []byte) (string, error) {
 		if cmd.Process == nil {
 			return nil
 		}
-		//nolint:gosec // G204 not applicable; this is a signal, not a shell command
+		//nolint:gosec // intentional signal delivery to the process group; not a shell execution
 		return syscall.Kill(-cmd.Process.Pid, syscall.SIGKILL)
 	}
 
