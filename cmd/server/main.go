@@ -25,6 +25,13 @@ const (
 	shutdownTimeout   = 10 * time.Second
 	readHeaderTimeout = 5 * time.Second
 	readTimeout       = 30 * time.Second
+	// writeTimeout must exceed the tesseract subprocess timeout (30 s) plus
+	// headroom for preprocessing and response serialisation, to ensure the
+	// response is always sent before the server forcibly closes the connection.
+	writeTimeout = 65 * time.Second
+	// idleTimeout closes keep-alive connections that sit idle, preventing
+	// goroutine and file-descriptor leaks under sustained traffic.
+	idleTimeout = 120 * time.Second
 )
 
 func main() {
@@ -41,13 +48,19 @@ func main() {
 		Level: slog.LevelInfo,
 	})))
 
-	r := handler.NewRouter()
+	r, err := handler.NewRouter()
+	if err != nil {
+		slog.Error("failed to initialise router", "err", err)
+		os.Exit(1)
+	}
 
 	srv := &http.Server{
 		Addr:              net.JoinHostPort("", strconv.Itoa(port)),
 		Handler:           r,
 		ReadHeaderTimeout: readHeaderTimeout,
 		ReadTimeout:       readTimeout,
+		WriteTimeout:      writeTimeout,
+		IdleTimeout:       idleTimeout,
 	}
 
 	slog.Info("ocr-sidecar starting", "port", port)
