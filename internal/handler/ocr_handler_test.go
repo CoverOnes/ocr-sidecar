@@ -901,7 +901,7 @@ func TestHandleInvalidImageNotEchoed(t *testing.T) {
 	if fw, werr := mw.CreateFormField("unrelated"); werr == nil {
 		_, _ = fw.Write([]byte("dummy"))
 	}
-	mw.Close()
+	_ = mw.Close()
 
 	w := httptest.NewRecorder()
 	req := httptest.NewRequest(http.MethodPost, "/ocr", &buf)

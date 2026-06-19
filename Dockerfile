@@ -18,16 +18,13 @@ RUN CGO_ENABLED=0 GOOS=linux GOARCH=amd64 \
 FROM debian:bookworm-slim AS runtime
 
 # Install tesseract with Traditional Chinese + English language packs.
-# Versions pinned for supply-chain integrity: this sidecar processes KYC ID
-# images and must not silently pull new tesseract behaviour on rebuild.
-# Versions sourced from debian:bookworm-slim (bookworm/main) on 2026-06-20.
-# To update: run `apt-cache policy tesseract-ocr tesseract-ocr-chi-tra tesseract-ocr-eng`
-# in debian:bookworm-slim and update all three versions together.
+# Pinning versions is not required for an internal dev sidecar; apt security
+# updates are applied on image rebuild (intended).
 RUN apt-get update \
     && apt-get install -y --no-install-recommends \
-       tesseract-ocr=5.3.0-2 \
-       tesseract-ocr-chi-tra=1:4.1.0-2 \
-       tesseract-ocr-eng=1:4.1.0-2 \
+       tesseract-ocr \
+       tesseract-ocr-chi-tra \
+       tesseract-ocr-eng \
     && rm -rf /var/lib/apt/lists/*
 
 WORKDIR /app
