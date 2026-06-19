@@ -151,8 +151,9 @@ func (h *OCRHandler) Handle(c *gin.Context) {
 
 	// Validate content type against the magic-byte allowlist.
 	if err := validateImageType(imgBytes, contentType); err != nil {
-		// Log the raw error server-side only; never echo internal detail to the client.
-		slog.Debug("image type validation failed", "err", err)
+		// Log at Warn (not Debug) so that bad-format upload probes are visible in
+		// production logs, which run at slog LevelInfo. Debug is swallowed in prod.
+		slog.Warn("image type validation failed", "err", err)
 		httpx.ErrCode(c, http.StatusBadRequest, "INVALID_IMAGE_TYPE", "invalid or unsupported image")
 		return
 	}
