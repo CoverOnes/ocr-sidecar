@@ -13,6 +13,7 @@ import (
 	"net/http/httptest"
 	"os/exec"
 	"strings"
+	"syscall"
 	"testing"
 	"time"
 
@@ -692,5 +693,177 @@ func TestRunTesseractContextTimeout(t *testing.T) {
 	// The context must have been cancelled/timed out.
 	if ctx.Err() == nil {
 		t.Errorf("expected context to be done after command exit, got Err=nil; cmd error: %v", err)
+	}
+}
+
+// TestProcessGroupKillOnTimeout verifies that the process-group kill defense
+// (round-2 fix [1]) causes the entire process group to be reaped on timeout.
+// We start a shell that spawns a sleep child, then cancel the context; both
+// the shell and the sleep subprocess must exit promptly.
+func TestProcessGroupKillOnTimeout(t *testing.T) {
+	if _, err := exec.LookPath("sh"); err != nil {
+		t.Skip("sh not available, skipping process-group kill test")
+	}
+	if _, err := exec.LookPath("sleep"); err != nil {
+		t.Skip("sleep not available, skipping process-group kill test")
+	}
+
+	ctx, cancel := context.WithTimeout(context.Background(), 80*time.Millisecond)
+	defer cancel()
+
+	// A shell that spawns a child sleep. Without Setpgid+group kill, the child
+	// would survive after the shell is killed by the context timeout.
+	cmd := exec.CommandContext(ctx, "sh", "-c", "sleep 30")
+	cmd.SysProcAttr = &syscall.SysProcAttr{Setpgid: true}
+	cmd.WaitDelay = 2 * time.Second
+	cmd.Cancel = func() error {
+		if cmd.Process == nil {
+			return nil
+		}
+		return syscall.Kill(-cmd.Process.Pid, syscall.SIGKILL)
+	}
+
+	err := cmd.Run()
+	if err == nil {
+		t.Fatal("expected error from cancelled context, got nil")
+	}
+	if ctx.Err() == nil {
+		t.Errorf("expected context to be done, got Err=nil; cmd err: %v", err)
+	}
+}
+
+// TestHandleValidationErrorsNotEchoed verifies round-2 fix [2]: the HTTP
+// handler returns a FIXED client-safe message for INVALID_IMAGE and
+// INVALID_IMAGE_TYPE codes, not the raw internal err.Error() string.
+// TestHandleImageTooLargeNotEchoed verifies that a forged-oversized-dimension
+// image returns a STATIC IMAGE_TOO_LARGE message and does NOT echo the raw error
+// (which embeds the exact pixel dimensions and the internal maxDecodedDimension
+// constant). Closes the third validation-error-echo branch missed in round-2.
+func TestHandleImageTooLargeNotEchoed(t *testing.T) {
+	gin.SetMode(gin.TestMode)
+	t.Setenv("OCR_ALLOW_NOAUTH", "true")
+	t.Setenv("OCR_SERVICE_TOKEN", "")
+	authMiddleware, err := ocrAuthMiddleware()
+	if err != nil {
+		t.Fatalf("ocrAuthMiddleware: %v", err)
+	}
+
+	r := gin.New()
+	r.SetTrustedProxies(nil) //nolint:errcheck // test-only engine
+	h := NewOCRHandler()
+	r.POST("/ocr", authMiddleware, h.Handle)
+
+	// Valid PNG magic + IHDR declaring 10000x10000 (> maxDecodedDimension 6000),
+	// only a few hundred bytes on the wire (the "claim huge in <100 KB" attack).
+	body := forgedHeaderPNG(t, 10000, 10000)
+
+	w := httptest.NewRecorder()
+	req := httptest.NewRequest(http.MethodPost, "/ocr", bytes.NewReader(body))
+	req.Header.Set("Content-Type", "image/png")
+	r.ServeHTTP(w, req)
+
+	if w.Code != http.StatusRequestEntityTooLarge {
+		t.Fatalf("expected 413, got %d (body: %s)", w.Code, w.Body.String())
+	}
+	respBody := w.Body.String()
+	if !strings.Contains(respBody, "IMAGE_TOO_LARGE") {
+		t.Errorf("response should carry IMAGE_TOO_LARGE code; got: %s", respBody)
+	}
+	if !strings.Contains(respBody, "image dimensions exceed the allowed limit") {
+		t.Errorf("response should carry the static dimension message; got: %s", respBody)
+	}
+	// MUST NOT leak the exact dimensions or the internal limit constant.
+	for _, leak := range []string{"10000", "6000"} {
+		if strings.Contains(respBody, leak) {
+			t.Errorf("response leaks internal detail %q: %s", leak, respBody)
+		}
+	}
+}
+
+func TestHandleValidationErrorsNotEchoed(t *testing.T) {
+	gin.SetMode(gin.TestMode)
+
+	// Build a minimal router wired to the real Handle (via OCR_ALLOW_NOAUTH).
+	t.Setenv("OCR_ALLOW_NOAUTH", "true")
+	t.Setenv("OCR_SERVICE_TOKEN", "")
+	authMiddleware, err := ocrAuthMiddleware()
+	if err != nil {
+		t.Fatalf("ocrAuthMiddleware: %v", err)
+	}
+
+	r := gin.New()
+	r.SetTrustedProxies(nil) //nolint:errcheck // test-only engine
+	h := NewOCRHandler()
+	r.POST("/ocr", authMiddleware, h.Handle)
+
+	const fixedMsg = "invalid or unsupported image"
+
+	tests := []struct {
+		name        string
+		body        []byte
+		contentType string
+		wantCode    string
+		wantMsg     string
+	}{
+		{
+			// Sending garbage bytes — triggers the "image too small to validate type" path.
+			name:        "INVALID_IMAGE_TYPE — garbage bytes return fixed message",
+			body:        []byte{0x00, 0x01, 0x02, 0x03, 0x04},
+			contentType: "image/png",
+			wantCode:    "INVALID_IMAGE_TYPE",
+			wantMsg:     fixedMsg,
+		},
+		{
+			// Empty body — triggers readImage error for raw-body path.
+			// The body is 0 bytes so validateImageType sees "too small".
+			name:        "INVALID_IMAGE_TYPE — empty body returns fixed message",
+			body:        []byte{},
+			contentType: "image/jpeg",
+			wantCode:    "INVALID_IMAGE_TYPE",
+			wantMsg:     fixedMsg,
+		},
+		{
+			// GIF magic bytes — unsupported format.
+			name:        "INVALID_IMAGE_TYPE — gif rejected with fixed message",
+			body:        []byte{0x47, 0x49, 0x46, 0x38, 0x39, 0x61},
+			contentType: "image/gif",
+			wantCode:    "INVALID_IMAGE_TYPE",
+			wantMsg:     fixedMsg,
+		},
+	}
+
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			w := httptest.NewRecorder()
+			req := httptest.NewRequest(http.MethodPost, "/ocr", bytes.NewReader(tc.body))
+			req.Header.Set("Content-Type", tc.contentType)
+			r.ServeHTTP(w, req)
+
+			body := w.Body.String()
+
+			// Must contain the fixed client-safe message.
+			if !strings.Contains(body, fixedMsg) {
+				t.Errorf("response body does not contain fixed message %q; got: %s", fixedMsg, body)
+			}
+
+			// Must NOT contain internal Go error strings that reveal implementation
+			// detail (e.g. "image too small to validate type", "got unknown format").
+			internalPhrases := []string{
+				"image too small",
+				"got unknown format",
+				"must be JPEG or PNG",
+				"image must be",
+			}
+			for _, phrase := range internalPhrases {
+				if strings.Contains(body, phrase) {
+					t.Errorf("response body leaks internal error phrase %q; got: %s", phrase, body)
+				}
+			}
+
+			// Must contain the correct error code.
+			if !strings.Contains(body, tc.wantCode) {
+				t.Errorf("response body missing error code %q; got: %s", tc.wantCode, body)
+			}
+		})
 	}
 }
